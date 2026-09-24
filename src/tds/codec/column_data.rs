@@ -13,6 +13,8 @@ mod float;
 mod guid;
 mod image;
 mod int;
+#[cfg(test)]
+mod legacy_codepages;
 mod money;
 mod plp;
 mod sql_variant;
@@ -441,19 +443,9 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     let collation = vlc.collation().ok_or_else(|| {
                         crate::Error::Protocol("string column missing collation".into())
                     })?;
-                    let mut encoder = collation.encoding()?.new_encoder();
-                    let len = encoder
-                        .max_buffer_length_from_utf8_without_replacement(str.len())
-                        .unwrap();
-                    let mut bytes = Vec::with_capacity(len);
-                    let (res, _) = encoder.encode_from_utf8_to_vec_without_replacement(
-                        str.as_ref(),
-                        &mut bytes,
-                        true,
-                    );
-                    if let encoding_rs::EncoderResult::Unmappable(_) = res {
-                        return Err(crate::Error::Encoding("unrepresentable character".into()));
-                    }
+                    let bytes = collation.codec()?.encode(str.as_ref()).ok_or_else(|| {
+                        crate::Error::Encoding("unrepresentable character".into())
+                    })?;
 
                     if bytes.len() > vlc.len() {
                         return Err(crate::Error::BulkInput(
@@ -560,19 +552,9 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                         let collation = vlc.collation().ok_or_else(|| {
                             crate::Error::Protocol("string column missing collation".into())
                         })?;
-                        let mut encoder = collation.encoding()?.new_encoder();
-                        let len = encoder
-                            .max_buffer_length_from_utf8_without_replacement(str.len())
-                            .unwrap();
-                        let mut bytes = Vec::with_capacity(len);
-                        let (res, _) = encoder.encode_from_utf8_to_vec_without_replacement(
-                            str.as_ref(),
-                            &mut bytes,
-                            true,
-                        );
-                        if let encoding_rs::EncoderResult::Unmappable(_) = res {
-                            return Err(crate::Error::Encoding("unrepresentable character".into()));
-                        }
+                        let bytes = collation.codec()?.encode(str.as_ref()).ok_or_else(|| {
+                            crate::Error::Encoding("unrepresentable character".into())
+                        })?;
 
                         dst.put_u32_le(bytes.len() as u32);
                         dst.extend_from_slice(bytes.as_slice());

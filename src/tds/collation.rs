@@ -5,8 +5,13 @@
 //!
 //! [1] <https://github.com/Microsoft/mssql-jdbc/blob/eb14f63077c47ef1fc1c690deb8cfab602baeb85/src/main/java/com/microsoft/sqlserver/jdbc/SQLCollation.java>
 //! [2] <https://github.com/lifthrasiir/rust-encoding/blob/496823171f15d9b9446b2ec3fb7765f22346256b/src/label.rs#L282>
+//!
+//! The CP437/CP850 high-byte tables follow the Unicode Consortium mappings:
+//! <https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/PC/CP437.TXT> and
+//! <https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/PC/CP850.TXT>.
 
 use encoding_rs::Encoding;
+use std::borrow::Cow;
 use std::fmt;
 
 use crate::error::Error;
@@ -42,7 +47,11 @@ impl Collation {
         self.info
     }
 
-    /// return an encoding for a given collation
+    /// Returns an `encoding_rs` encoding for a given collation.
+    ///
+    /// CP437 and CP850 are supported by internal row/bulk codecs, but cannot
+    /// be represented by `encoding_rs::Encoding`; this method still returns
+    /// an error for those code pages.
     pub fn encoding(&self) -> crate::Result<&'static Encoding> {
         let res = if self.sort_id == 0 {
             lcid_to_encoding(self.lcid())
@@ -61,15 +70,127 @@ impl Collation {
             )
         })
     }
+
+    pub(crate) fn codec(&self) -> crate::Result<CollationCodec> {
+        match self.sort_id {
+            30..=35 => Ok(CollationCodec::Cp437),
+            40..=45 | 49 | 55..=61 => Ok(CollationCodec::Cp850),
+            _ => self.encoding().map(CollationCodec::BuiltIn),
+        }
+    }
 }
 
 impl fmt::Display for Collation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.encoding() {
-            Ok(encoding) => write!(f, "{}", encoding.name()),
+        match self.codec() {
+            Ok(codec) => write!(f, "{}", codec.name()),
             _ => write!(f, "None"),
         }
     }
+}
+
+const CP437_HIGH: [char; 128] = [
+    '\u{c7}', '\u{fc}', '\u{e9}', '\u{e2}', '\u{e4}', '\u{e0}', '\u{e5}', '\u{e7}', '\u{ea}',
+    '\u{eb}', '\u{e8}', '\u{ef}', '\u{ee}', '\u{ec}', '\u{c4}', '\u{c5}', '\u{c9}', '\u{e6}',
+    '\u{c6}', '\u{f4}', '\u{f6}', '\u{f2}', '\u{fb}', '\u{f9}', '\u{ff}', '\u{d6}', '\u{dc}',
+    '\u{a2}', '\u{a3}', '\u{a5}', '\u{20a7}', '\u{192}', '\u{e1}', '\u{ed}', '\u{f3}', '\u{fa}',
+    '\u{f1}', '\u{d1}', '\u{aa}', '\u{ba}', '\u{bf}', '\u{2310}', '\u{ac}', '\u{bd}', '\u{bc}',
+    '\u{a1}', '\u{ab}', '\u{bb}', '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}',
+    '\u{2561}', '\u{2562}', '\u{2556}', '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}',
+    '\u{255c}', '\u{255b}', '\u{2510}', '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}',
+    '\u{253c}', '\u{255e}', '\u{255f}', '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}',
+    '\u{2550}', '\u{256c}', '\u{2567}', '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}',
+    '\u{2552}', '\u{2553}', '\u{256b}', '\u{256a}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}',
+    '\u{258c}', '\u{2590}', '\u{2580}', '\u{3b1}', '\u{df}', '\u{393}', '\u{3c0}', '\u{3a3}',
+    '\u{3c3}', '\u{b5}', '\u{3c4}', '\u{3a6}', '\u{398}', '\u{3a9}', '\u{3b4}', '\u{221e}',
+    '\u{3c6}', '\u{3b5}', '\u{2229}', '\u{2261}', '\u{b1}', '\u{2265}', '\u{2264}', '\u{2320}',
+    '\u{2321}', '\u{f7}', '\u{2248}', '\u{b0}', '\u{2219}', '\u{b7}', '\u{221a}', '\u{207f}',
+    '\u{b2}', '\u{25a0}', '\u{a0}',
+];
+
+const CP850_HIGH: [char; 128] = [
+    '\u{c7}', '\u{fc}', '\u{e9}', '\u{e2}', '\u{e4}', '\u{e0}', '\u{e5}', '\u{e7}', '\u{ea}',
+    '\u{eb}', '\u{e8}', '\u{ef}', '\u{ee}', '\u{ec}', '\u{c4}', '\u{c5}', '\u{c9}', '\u{e6}',
+    '\u{c6}', '\u{f4}', '\u{f6}', '\u{f2}', '\u{fb}', '\u{f9}', '\u{ff}', '\u{d6}', '\u{dc}',
+    '\u{f8}', '\u{a3}', '\u{d8}', '\u{d7}', '\u{192}', '\u{e1}', '\u{ed}', '\u{f3}', '\u{fa}',
+    '\u{f1}', '\u{d1}', '\u{aa}', '\u{ba}', '\u{bf}', '\u{ae}', '\u{ac}', '\u{bd}', '\u{bc}',
+    '\u{a1}', '\u{ab}', '\u{bb}', '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}',
+    '\u{c1}', '\u{c2}', '\u{c0}', '\u{a9}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}',
+    '\u{a2}', '\u{a5}', '\u{2510}', '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}',
+    '\u{253c}', '\u{e3}', '\u{c3}', '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}',
+    '\u{2550}', '\u{256c}', '\u{a4}', '\u{f0}', '\u{d0}', '\u{ca}', '\u{cb}', '\u{c8}', '\u{131}',
+    '\u{cd}', '\u{ce}', '\u{cf}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{a6}',
+    '\u{cc}', '\u{2580}', '\u{d3}', '\u{df}', '\u{d4}', '\u{d2}', '\u{f5}', '\u{d5}', '\u{b5}',
+    '\u{fe}', '\u{de}', '\u{da}', '\u{db}', '\u{d9}', '\u{fd}', '\u{dd}', '\u{af}', '\u{b4}',
+    '\u{ad}', '\u{b1}', '\u{2017}', '\u{be}', '\u{b6}', '\u{a7}', '\u{f7}', '\u{b8}', '\u{b0}',
+    '\u{a8}', '\u{b7}', '\u{b9}', '\u{b3}', '\u{b2}', '\u{25a0}', '\u{a0}',
+];
+
+pub(crate) enum CollationCodec {
+    BuiltIn(&'static Encoding),
+    Cp437,
+    Cp850,
+}
+
+impl CollationCodec {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::BuiltIn(encoding) => encoding.name(),
+            Self::Cp437 => "CP437",
+            Self::Cp850 => "CP850",
+        }
+    }
+
+    pub(crate) fn decode(&self, bytes: &[u8]) -> Option<String> {
+        match self {
+            Self::BuiltIn(encoding) => encoding
+                .decode_without_bom_handling_and_without_replacement(bytes)
+                .map(Cow::into_owned),
+            Self::Cp437 => Some(decode_single_byte(bytes, &CP437_HIGH)),
+            Self::Cp850 => Some(decode_single_byte(bytes, &CP850_HIGH)),
+        }
+    }
+
+    pub(crate) fn encode(&self, text: &str) -> Option<Vec<u8>> {
+        match self {
+            Self::BuiltIn(encoding) => {
+                let mut encoder = encoding.new_encoder();
+                let capacity =
+                    encoder.max_buffer_length_from_utf8_without_replacement(text.len())?;
+                let mut bytes = Vec::with_capacity(capacity);
+                let (result, _) =
+                    encoder.encode_from_utf8_to_vec_without_replacement(text, &mut bytes, true);
+                match result {
+                    encoding_rs::EncoderResult::InputEmpty => Some(bytes),
+                    _ => None,
+                }
+            }
+            Self::Cp437 => encode_single_byte(text, &CP437_HIGH),
+            Self::Cp850 => encode_single_byte(text, &CP850_HIGH),
+        }
+    }
+}
+
+fn decode_single_byte(bytes: &[u8], high: &[char; 128]) -> String {
+    bytes
+        .iter()
+        .map(|&byte| match byte {
+            0..=0x7f => char::from(byte),
+            _ => high[usize::from(byte) - 0x80],
+        })
+        .collect()
+}
+
+fn encode_single_byte(text: &str, high: &[char; 128]) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(text.len());
+    for character in text.chars() {
+        let byte = match character {
+            '\0'..='\u{7f}' => character as u8,
+            _ => high.iter().position(|&mapped| mapped == character)? as u8 + 0x80,
+        };
+        bytes.push(byte);
+    }
+    Some(bytes)
 }
 
 /// https://github.com/Microsoft/mssql-jdbc/blob/eb14f63077c47ef1fc1c690deb8cfab602baeb85/src/main/java/com/microsoft/sqlserver/jdbc/SQLCollation.java#L102-L310

@@ -164,11 +164,10 @@ where
             let _max_len = src.read_u16_le().await?;
 
             let buf = read_bytes(src, data_len).await?;
-            let encoder = collation.encoding()?;
-            let s = encoder
-                .decode_without_bom_handling_and_without_replacement(buf.as_ref())
-                .ok_or_else(|| Error::Encoding("sql_variant: invalid sequence".into()))?
-                .to_string();
+            let codec = collation.codec()?;
+            let s = codec
+                .decode(buf.as_ref())
+                .ok_or_else(|| Error::Encoding("sql_variant: invalid sequence".into()))?;
 
             ColumnData::String(Some(s.into()))
         }

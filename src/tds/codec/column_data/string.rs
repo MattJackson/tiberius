@@ -21,12 +21,11 @@ where
             let collation = collation
                 .as_ref()
                 .ok_or_else(|| Error::Protocol("string column missing collation".into()))?;
-            let encoder = collation.encoding()?;
+            let codec = collation.codec()?;
 
-            let s = encoder
-                .decode_without_bom_handling_and_without_replacement(buf.as_ref())
-                .ok_or_else(|| Error::Encoding("invalid sequence".into()))?
-                .to_string();
+            let s = codec
+                .decode(buf.as_ref())
+                .ok_or_else(|| Error::Encoding("invalid sequence".into()))?;
 
             Ok(Some(s.into()))
         }
