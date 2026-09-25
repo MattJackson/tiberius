@@ -60,7 +60,8 @@ jobs:
         with:
           toolchain: stable
       - name: Fetch dev
-        run: git fetch --no-tags origin +refs/heads/dev:refs/remotes/origin/dev
+        # Tolerate a missing dev branch here; the gate then reports it.
+        run: git fetch --no-tags origin +refs/heads/dev:refs/remotes/origin/dev || true
       - name: Release gate
         id: gate
         env:

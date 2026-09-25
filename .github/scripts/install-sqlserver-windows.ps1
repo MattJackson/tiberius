@@ -1,7 +1,7 @@
 # Install SQL Server 2019 (default instance MSSQLSERVER) on a GitHub-hosted
 # Windows runner for the integrated-auth tests: TCP on 1433, named pipes, and
-# SQL Browser (for the named-instance tests), with the runner's Administrators
-# group as sysadmin so `IntegratedSecurity=true` logs in.
+# SQL Browser (for the named-instance tests), mixed-mode auth, and the runner's
+# Administrators group as sysadmin so `IntegratedSecurity=true` logs in.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -20,6 +20,10 @@ Set-ItemProperty -Path "$net\Tcp" -Name Enabled -Value 1
 Set-ItemProperty -Path "$net\Tcp\IPAll" -Name TcpPort -Value '1433'
 Set-ItemProperty -Path "$net\Tcp\IPAll" -Name TcpDynamicPorts -Value ''
 Set-ItemProperty -Path "$net\Np" -Name Enabled -Value 1
+
+# Mixed-mode authentication: the special-character password tests connect as
+# SQL logins they create, which Windows-only mode rejects (error 18452).
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$inst\MSSQLServer" -Name LoginMode -Value 2
 
 # `(local)` alias over TCP, as the previous CI did.
 New-Item -Path 'HKLM:\SOFTWARE\Microsoft\MSSQLServer\Client' -Name ConnectTo -Force | Out-Null

@@ -69,7 +69,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y openssl libkrb5-dev
       - name: Wait for SQL Server
         run: .github/scripts/wait-for-sql.sh mssql-${{ matrix.database }}
-      - run: cargo test ${{ matrix.features }}
+      - run: cargo test --no-fail-fast ${{ matrix.features }}
 
   macos:
     name: macos (SQL 2022 via colima, ${{ matrix.name }})
@@ -117,7 +117,7 @@ jobs:
         run: docker compose -f docker-compose.yml up -d mssql-2022
       - name: Wait for SQL Server
         run: .github/scripts/wait-for-sql.sh mssql-2022 exec
-      - run: cargo test ${{ matrix.features }}
+      - run: cargo test --no-fail-fast ${{ matrix.features }}
 
   windows:
     name: windows (SQL 2019, integrated auth, ${{ matrix.name }})
@@ -152,7 +152,7 @@ jobs:
         # used by the script's readiness probe.
         shell: powershell
         run: ./.github/scripts/install-sqlserver-windows.ps1
-      - run: cargo test ${{ matrix.features }}
+      - run: cargo test --no-fail-fast ${{ matrix.features }}
 
   semver:
     name: semver-checks (strict, vs crates.io)
