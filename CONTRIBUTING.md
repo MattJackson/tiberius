@@ -17,18 +17,42 @@
 
 ## Releasing
 
-`main` always equals the latest crates.io release.
+`main` always equals the latest crates.io release. Changes that bump no
+version may still land on `main` when they touch no crate code (CI, docs,
+tests); the release gate passes them as a no-op. Crate code (`src/`,
+`build.rs`, the manifests, `tiberius-macros/src/`) only reaches `main`
+through a release.
 
 1. On `dev`, land a PR that bumps `version` in `Cargo.toml` (and in
    `tiberius-macros/Cargo.toml` if the macros changed) and adds a
-   `## Version X.Y.Z` section to `CHANGELOG.md`.
-2. Open a PR from `dev` into `main`. The `release gate` check verifies the
-   version bump, the changelog heading, that the tag is free, and that the
-   tree is identical to a `dev` commit that passed QA.
-3. Merge it. Publishing is automatic: `.github/workflows/release.yml`
-   publishes to crates.io with Trusted Publishing, verifies the index, then
-   tags `vX.Y.Z` and creates the GitHub Release.
+   `## Version X.Y.Z` section to `CHANGELOG.md`. Wait for the merge queue
+   to finish; that QA run is what the release is checked against.
+2. Cut a release branch: a single commit on top of `main` whose tree is
+   exactly `dev`'s tree.
 
-If a release fails part-way, re-run it with the Release workflow's
-"Run workflow" button on `main` (dry run off). Crates already published from
-that commit are skipped.
+   ```sh
+   git fetch origin
+   git switch -c release/X.Y.Z origin/main
+   git read-tree -u --reset origin/dev   # index + worktree = dev's tree
+   git commit -m "chore: release X.Y.Z"
+   git push origin release/X.Y.Z
+   ```
+
+   `main` only accepts rebase or squash merges, which rewrite commits, so
+   `dev` and `main` never share history after the first release. A branch
+   built this way always rebases cleanly, and it lands exactly the tree QA
+   saw.
+3. Open a PR from `release/X.Y.Z` into `main`. The `release gate` check
+   verifies:
+   - the version bump and the changelog heading;
+   - that the tag is free;
+   - that the branch contains the current `main` tip;
+   - that the tree is identical to a `dev` commit that passed QA.
+4. Merge it with **Rebase and merge** (or squash). Publishing is automatic:
+   `.github/workflows/release.yml` publishes to crates.io with Trusted
+   Publishing, verifies the index, then tags `vX.Y.Z` and creates the
+   GitHub Release.
+
+If a release fails part-way, re-run the failed jobs, or use the Release
+workflow's "Run workflow" button on `main` with dry run off. Crates already
+published from that commit are skipped.

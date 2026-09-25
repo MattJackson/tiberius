@@ -113,9 +113,10 @@ class Fixture:
     def registry(self):
         return rg.Registry(f"file://{self.index}/")
 
-    def gate(self, sha="HEAD", qa_runs=None, qa_ref="dev"):
+    def gate(self, sha="HEAD", qa_runs=None, qa_ref="dev", change_base=None, target_tip=None):
         sha = sh(self.repo, "git", "rev-parse", sha)
-        return rg.evaluate(self.repo, sha, self.registry(), "tiberius", qa_runs, qa_ref)
+        return rg.evaluate(self.repo, sha, self.registry(), "tiberius", qa_runs, qa_ref,
+                           change_base=change_base, target_tip=target_tip)
 
 
 def run_for(sha, event="merge_group", conclusion="success"):
@@ -142,26 +143,76 @@ class GateTests(unittest.TestCase):
         self.fx.write_ws(tib, mac, changelog=changelog, **kw)
         return self.fx.commit(f"release {tib}")
 
-    # -- the no-release rule --------------------------------------------------
+    def touch(self, path, text="x\n", msg="change"):
+        f = self.fx.repo / path
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+        return self.fx.commit(msg)
 
-    def test_nothing_to_release_fails(self):
-        r = self.fx.gate()
-        self.assertEqual(r.errors, [rg.NO_RELEASE_MSG])
-        self.assertEqual({c.action for c in r.crates}, {"unchanged"})
+    # -- (b) no version bump: change-based check ------------------------------
 
-    def test_unbumped_changed_contents_fail(self):
-        (self.fx.repo / "src" / "lib.rs").write_text("pub fn g() {}\n")
-        self.fx.commit("change")
-        r = self.fx.gate()
-        self.assertError(r, "tiberius: contents differ from the published tiberius 0.13.0")
-        self.assertError(r, "modified src/lib.rs")
-        self.assertIn(rg.NO_RELEASE_MSG, r.errors)
+    def test_no_bump_ci_only_change_is_a_noop(self):
+        base = sh(self.fx.repo, "git", "rev-parse", "HEAD")
+        self.touch(".github/workflows/ci.yml", "on: push\n")
+        self.touch("README.md", "# readme\n")
+        self.touch("tests/query.rs", "// test\n")
+        self.touch("CHANGELOG.md", "# Changes\n\n## Unreleased\n")
+        r = self.fx.gate(change_base=base)
+        self.assertEqual(r.errors, [])
+        self.assertFalse(r.release)
+        self.assertTrue(any(rg.NOOP_MSG in n for n in r.notes), r.notes)
+        self.assertEqual(r.publish, [])
 
-    def test_non_package_files_do_not_count(self):
-        # Excluded by .gitignore -> not in `cargo package --list`.
+    def test_no_bump_noop_even_when_main_has_unreleased_code(self):
+        # Like upstream main today: crate code already differs from the
+        # published .crate, but THIS change only touches CI.
+        (self.fx.repo / "src" / "lib.rs").write_text("pub fn unreleased() {}\n")
+        base = self.fx.commit("earlier unreleased code")
+        self.touch(".github/workflows/release.yml", "on: push\n")
+        r = self.fx.gate(change_base=base)
+        self.assertEqual(r.errors, [])
+        self.assertFalse(r.release)
+
+    def test_no_bump_crate_change_fails(self):
+        cases = {
+            "src/lib.rs": "pub fn g() {}\n",
+            "src/new/module.rs": "// new\n",
+            "build.rs": "fn main() {}\n",
+            "Cargo.toml": None,
+            "tiberius-macros/src/lib.rs": "// changed\n",
+            "tiberius-macros/Cargo.toml": None,
+        }
+        for path, text in cases.items():
+            with self.subTest(path):
+                base = sh(self.fx.repo, "git", "rev-parse", "HEAD")
+                if text is None:
+                    f = self.fx.repo / path
+                    f.write_text(f.read_text() + "# touched\n")
+                    self.fx.commit("manifest")
+                else:
+                    self.touch(path, text)
+                r = self.fx.gate(change_base=base)
+                self.assertError(r, rg.NOT_RELEASED_MSG)
+                self.assertError(r, path)
+                self.assertFalse(r.release)
+
+    def test_no_bump_defaults_to_first_parent(self):
+        self.touch("src/lib.rs", "pub fn g() {}\n")
+        self.touch("docs/GUIDE.md", "guide\n")
+        # HEAD^..HEAD only touches docs.
+        self.assertEqual(self.fx.gate().errors, [])
+        self.touch("src/lib.rs", "pub fn h() {}\n")
+        self.assertError(self.fx.gate(), rg.NOT_RELEASED_MSG)
+
+    def test_no_bump_lower_and_invalid_still_fail(self):
+        base = sh(self.fx.repo, "git", "rev-parse", "HEAD")
+        self.bump(tib="0.12.9", changelog=("0.12.9",))
+        self.assertError(self.fx.gate(change_base=base), "is lower than the latest published 0.13.0")
+
+    def test_gitignored_files_do_not_count(self):
         (self.fx.repo / "target").mkdir(exist_ok=True)
         (self.fx.repo / "target" / "junk").write_text("x")
-        self.assertEqual(self.fx.gate().errors, [rg.NO_RELEASE_MSG])
+        self.assertEqual(self.fx.gate(change_base="HEAD").errors, [])
 
     # -- the happy path (mirrors fixes/stacked: tiberius 0.13.1, macros unchanged) --
 
@@ -193,8 +244,29 @@ class GateTests(unittest.TestCase):
     def test_macros_changed_without_bump_fails(self):
         self.bump(macros_body="// changed\n")
         r = self.fx.gate()
-        self.assertError(r, "tiberius-macros: contents differ from the published tiberius-macros 0.1.0")
+        self.assertTrue(r.release)
+        self.assertError(r, "tiberius-macros: crate code differs from the published tiberius-macros 0.1.0")
         self.assertError(r, "modified src/lib.rs")
+
+    def test_unreleased_crate_non_code_change_is_fine(self):
+        # A non-code file inside the macros package (ships in its .crate)
+        # does not force a macros release.
+        (self.fx.repo / "tiberius-macros" / "NOTES.md").write_text("notes\n")
+        sha = self.bump()
+        self.assertEqual(self.fx.gate(qa_runs=[run_for(sha)]).errors, [])
+
+    def test_release_branch_must_contain_target_tip(self):
+        # main moved on (e.g. a CI-only change) after the release branch was cut.
+        sh(self.fx.repo, "git", "checkout", "-q", "-b", "main")
+        main_tip = self.touch(".github/x.yml", "x\n", "ci on main")
+        sh(self.fx.repo, "git", "checkout", "-q", "dev")
+        sha = self.bump()
+        r = self.fx.gate(qa_runs=[run_for(sha)], target_tip=main_tip)
+        self.assertError(r, "not based on the current target tip")
+        # Rebuilt on main with dev's tree (the release-branch recipe): passes.
+        snap = sh(self.fx.repo, "git", "commit-tree", f"{sha}^{{tree}}", "-p", main_tip, "-m", "release")
+        r = self.fx.gate(sha=snap, qa_runs=[run_for(sha)], target_tip=main_tip)
+        self.assertEqual(r.errors, [])
 
     def test_missing_changelog_heading_fails(self):
         self.bump(changelog=("0.13.0",))
@@ -256,10 +328,25 @@ class GateTests(unittest.TestCase):
         r = self.fx.gate(sha=m, qa_runs=[run_for(d)])
         self.assertEqual(r.errors, [])
 
+    def test_rebase_merge_keeps_tree_identity(self):
+        # GitHub "Rebase and merge" rewrites every commit (new SHAs), but when
+        # the target tip is an ancestor of the PR head the final tree is the
+        # head's tree, so the QA'd dev tree still matches.
+        base = sh(self.fx.repo, "git", "rev-parse", "HEAD")
+        self.touch("src/lib.rs", "pub fn feature() {}\n", "feature")
+        d = self.bump()
+        sh(self.fx.repo, "git", "checkout", "-q", "-b", "main", base)
+        sh(self.fx.repo, "git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+           "cherry-pick", "-x", f"{base}..{d}")
+        m = sh(self.fx.repo, "git", "rev-parse", "HEAD")
+        self.assertNotEqual(m, d)
+        r = self.fx.gate(sha=m, qa_runs=[run_for(d)], change_base=base)
+        self.assertEqual(r.errors, [])
+        self.assertTrue(r.release)
+
     def test_qa_run_not_on_dev_fails(self):
         sh(self.fx.repo, "git", "checkout", "-q", "-b", "side")
         sha = self.bump()
-        sh(self.fx.repo, "git", "checkout", "-q", "dev")
         r = self.fx.gate(sha=sha, qa_runs=[run_for(sha, event="workflow_dispatch")])
         self.assertError(r, "does not match any commit on dev")
 
@@ -270,6 +357,7 @@ class GateTests(unittest.TestCase):
         self.fx.publish("tiberius", "0.13.1", vcs_sha=sha)
         r = self.fx.gate(qa_runs=[run_for(sha)])
         self.assertEqual(r.errors, [])
+        self.assertTrue(r.release)
         self.assertEqual([c.name for c in r.resume], ["tiberius"])
         self.assertEqual(r.publish, [])
 

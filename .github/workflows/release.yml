@@ -1,11 +1,14 @@
 name: Release
 
 # main always equals the latest crates.io release. A release is a maintainer
-# PR dev -> main that bumps the version and CHANGELOG:
+# PR into main whose tree is a QA'd dev state with a version + CHANGELOG bump
+# (see CONTRIBUTING.md). Changes that bump no version may only touch non-crate
+# files (CI, docs, tests); they pass the gate as a no-op and publish nothing.
 #
 #   pull_request into main  -> `release gate` only (required check on main)
-#   push to main            -> gate, then publish via crates.io Trusted
-#                              Publishing, verify the index, tag + GitHub Release
+#   push to main            -> gate; if it is a release, publish via crates.io
+#                              Trusted Publishing, verify the index, then
+#                              tag + GitHub Release
 #   workflow_dispatch       -> retry a failed release on main (resumes: crates
 #                              already published from this commit are skipped),
 #                              or `dry_run` on any ref to exercise the publish
@@ -48,12 +51,16 @@ jobs:
       contents: read
       actions: read # list qa.yml runs for the tree-identity check
     outputs:
+      release: ${{ steps.gate.outputs.release }}
       publish: ${{ steps.gate.outputs.publish }}
       plan: ${{ steps.gate.outputs.plan }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          # All branches and tags: the gate needs dev's history and the tags.
+          # On PRs judge the PR head itself (not GitHub's test merge): with a
+          # rebase or squash merge, the head's tree is what lands.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # All branches and tags: the gate needs dev's and main's history and the tags.
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -66,8 +73,23 @@ jobs:
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ github.sha }}
-        run: python3 .github/scripts/release_gate.py gate --sha "$SHA" --registry "$REGISTRY" --qa-ref origin/dev
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          range=()
+          case "$EVENT" in
+            # PR: judge what the PR changes (merge base...head); a release
+            # must also contain the current target tip.
+            pull_request) range=(--target "origin/$BASE_REF") ;;
+            # Push: judge before..after (zero SHA / missing: first parent).
+            push) range=(--before "$BEFORE") ;;
+            # Dispatch: first parent.
+          esac
+          python3 .github/scripts/release_gate.py gate --sha "$SHA" --registry "$REGISTRY" \
+            --qa-ref origin/dev "${range[@]}"
 
   publish:
     name: publish
@@ -75,11 +97,13 @@ jobs:
     # Real publishes: push to main (or a dispatch retry on main) in the
     # upstream repo, or in a fork that opted into staging.crates.io. Dry runs:
     # any dispatch with dry_run, in any repo.
+    # Only when the gate decided this commit is a release.
     if: >-
+      needs.gate.outputs.release == 'true' && (
       (github.event_name == 'workflow_dispatch' && inputs.dry_run) ||
       ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
        github.ref == 'refs/heads/main' &&
-       (github.repository == 'tiberius-rs/tiberius' || vars.RELEASE_REGISTRY == 'staging'))
+       (github.repository == 'tiberius-rs/tiberius' || vars.RELEASE_REGISTRY == 'staging')))
     runs-on: ubuntu-latest
     permissions:
       contents: write # gh release create (creates the tag)
