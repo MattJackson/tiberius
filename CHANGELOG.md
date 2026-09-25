@@ -1,9 +1,13 @@
 # Changes
 
+## Version 0.13.1-proof.2
+
+- Second throwaway pre-release (rebase-merge cycle 2). Never published.
+
 ## Version 0.13.1-proof.1
 
-- Throwaway pre-release used only to prove the release pipeline on a fork.
-  Never published.
+- Throwaway pre-release used to prove the release pipeline on a fork
+  (edited after release: overlaps the cycle-1 change). Never published.
 
 ## Version 0.13.0
 
