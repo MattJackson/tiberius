@@ -165,11 +165,15 @@ where
 
             let buf = read_bytes(src, data_len).await?;
             let codec = collation.codec()?;
-            let s = codec
-                .decode(buf.as_ref())
-                .ok_or_else(|| Error::Encoding("sql_variant: invalid sequence".into()))?;
+            let value = if src.context().lossy_codepage() {
+                codec.decode_lossy(buf.as_ref())
+            } else {
+                codec
+                    .decode(buf.as_ref())
+                    .ok_or_else(|| Error::Encoding("sql_variant: invalid sequence".into()))?
+            };
 
-            ColumnData::String(Some(s.into()))
+            ColumnData::String(Some(value.into()))
         }
         VarLenType::NChar | VarLenType::NVarchar => {
             // propData = collation (5 bytes) + max length (2 bytes)

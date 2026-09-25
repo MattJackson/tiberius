@@ -15,6 +15,8 @@ mod image;
 mod int;
 #[cfg(test)]
 mod legacy_codepages;
+#[cfg(test)]
+mod lossy_codepage;
 mod money;
 mod plp;
 mod sql_variant;

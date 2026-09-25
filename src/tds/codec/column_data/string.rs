@@ -23,11 +23,15 @@ where
                 .ok_or_else(|| Error::Protocol("string column missing collation".into()))?;
             let codec = collation.codec()?;
 
-            let s = codec
-                .decode(buf.as_ref())
-                .ok_or_else(|| Error::Encoding("invalid sequence".into()))?;
+            let value = if src.context().lossy_codepage() {
+                codec.decode_lossy(buf.as_ref())
+            } else {
+                codec
+                    .decode(buf.as_ref())
+                    .ok_or_else(|| Error::Encoding("invalid sequence".into()))?
+            };
 
-            Ok(Some(s.into()))
+            Ok(Some(value.into()))
         }
         // UTF-16
         (Some(buf), _) => {

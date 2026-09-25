@@ -135,6 +135,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             // Row-decode preference; unrelated to handshake timing, so set it up
             // front alongside the SPN.
             context.set_lossy_utf16(config.lossy_utf16_decoding);
+            context.set_lossy_codepage(config.lossy_codepage_decoding);
             context
         };
 

@@ -63,6 +63,7 @@ pub struct Config {
     pub(crate) handshake_timeout: Option<Duration>,
     pub(crate) command_timeout: Option<Duration>,
     pub(crate) lossy_utf16_decoding: bool,
+    pub(crate) lossy_codepage_decoding: bool,
     #[cfg(any(
         feature = "rustls",
         feature = "native-tls",
@@ -256,6 +257,7 @@ impl Default for Config {
             handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
             command_timeout: Some(DEFAULT_COMMAND_TIMEOUT),
             lossy_utf16_decoding: false,
+            lossy_codepage_decoding: false,
             #[cfg(any(
                 feature = "rustls",
                 feature = "native-tls",
@@ -667,8 +669,9 @@ impl Config {
     /// Scope and guarantees:
     ///
     /// - Only NVARCHAR/NCHAR (`string`) and NTEXT (`text`) decoding is affected.
-    ///   `XML` columns and code-page (`VARCHAR`/`CHAR`/`TEXT`) columns are
-    ///   always decoded strictly, regardless of this setting.
+    ///   `XML` columns are always decoded strictly. Code-page
+    ///   (`VARCHAR`/`CHAR`/`TEXT`) columns are controlled independently by
+    ///   [`Config::lossy_codepage_decoding`].
     /// - Framing/length validation is always enforced: an odd byte length for a
     ///   UTF-16 value is still a protocol error in both modes, because it
     ///   indicates a desynced stream rather than merely bad Unicode.
@@ -696,6 +699,45 @@ impl Config {
     /// See [`lossy_utf16_decoding`](Config::lossy_utf16_decoding).
     pub fn get_lossy_utf16_decoding(&self) -> bool {
         self.lossy_utf16_decoding
+    }
+
+    /// Enables lossy decoding for code-page character row values.
+    ///
+    /// Defaults to `false`: bytes that are invalid in the column's collation
+    /// cause an [`Error::Encoding`](crate::Error::Encoding) error. Enabling
+    /// this option replaces those sequences with `U+FFFD` so legacy rows
+    /// containing invalid bytes can still be read.
+    ///
+    /// Replacement follows `encoding_rs` / WHATWG decoding, not SQL Server's
+    /// `CONVERT(NVARCHAR)` behavior. For example, under `Chinese_PRC_CI_AS`,
+    /// bytes `61 81 20 62` decode to `"a\u{fffd} b"` and a lone `FF` decodes
+    /// to `"\u{fffd}"`; the server may instead use `?` or a private-use character.
+    /// CP437 and CP850 define every byte, so this option does not change their
+    /// decoded values.
+    ///
+    /// Applies to `CHAR`, `VARCHAR` (including `VARCHAR(MAX)`), `TEXT`, and
+    /// `CHAR`/`VARCHAR` values inside `SQL_VARIANT`. The column's declared
+    /// collation always determines the encoding; BOM-like bytes are not
+    /// stripped or used to select another encoding. Unknown collations and
+    /// malformed protocol lengths still produce errors.
+    ///
+    /// Unicode values are controlled independently by
+    /// [`Config::lossy_utf16_decoding`]. XML, metadata, protocol strings, and
+    /// outgoing character encoding are unaffected.
+    ///
+    /// ```
+    /// let mut config = tiberius::Config::new();
+    /// config.lossy_codepage_decoding(true);
+    /// ```
+    pub fn lossy_codepage_decoding(&mut self, lossy: bool) {
+        self.lossy_codepage_decoding = lossy;
+    }
+
+    /// Returns whether lossy code-page row decoding is enabled.
+    ///
+    /// See [`Config::lossy_codepage_decoding`] for the scope of this option.
+    pub fn get_lossy_codepage_decoding(&self) -> bool {
+        self.lossy_codepage_decoding
     }
 
     /// Supplies a client certificate and private key used to authenticate the
@@ -1174,6 +1216,14 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enables lossy code-page row decoding. Defaults to `false`.
+    ///
+    /// See [`Config::lossy_codepage_decoding`] for the scope of this option.
+    pub fn lossy_codepage_decoding(mut self, lossy: bool) -> Self {
+        self.inner.lossy_codepage_decoding = lossy;
+        self
+    }
+
     /// Supplies a client certificate and private key for mutual TLS.
     ///
     /// See [`Config::client_certificate`] for details and backend support.
@@ -1645,6 +1695,27 @@ mod tests {
     #[test]
     fn lossy_utf16_decoding_defaults_to_false() {
         let config = Config::new();
+        assert!(!config.get_lossy_utf16_decoding());
+    }
+
+    #[test]
+    fn lossy_codepage_decoding_defaults_and_setter() {
+        let mut config = Config::new();
+        assert!(!config.get_lossy_codepage_decoding());
+        config.lossy_codepage_decoding(true);
+        assert!(config.get_lossy_codepage_decoding());
+        assert!(!config.get_lossy_utf16_decoding());
+        config.lossy_utf16_decoding(true);
+        config.lossy_codepage_decoding(false);
+        assert!(!config.get_lossy_codepage_decoding());
+        assert!(config.get_lossy_utf16_decoding());
+    }
+
+    #[test]
+    fn config_builder_sets_lossy_codepage_decoding() {
+        assert!(!Config::builder().build().get_lossy_codepage_decoding());
+        let config = Config::builder().lossy_codepage_decoding(true).build();
+        assert!(config.get_lossy_codepage_decoding());
         assert!(!config.get_lossy_utf16_decoding());
     }
 

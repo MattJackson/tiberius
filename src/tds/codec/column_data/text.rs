@@ -29,9 +29,13 @@ where
             crate::sql_read_bytes::read_bytes_into(src, &mut buf, text_len, super::MAX_PREALLOC)
                 .await?;
 
-            codec
-                .decode(buf.as_ref())
-                .ok_or_else(|| Error::Encoding("invalid sequence".into()))?
+            if src.context().lossy_codepage() {
+                codec.decode_lossy(buf.as_ref())
+            } else {
+                codec
+                    .decode(buf.as_ref())
+                    .ok_or_else(|| Error::Encoding("invalid sequence".into()))?
+            }
         }
         // NTEXT
         None => {

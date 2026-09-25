@@ -151,6 +151,14 @@ impl CollationCodec {
         }
     }
 
+    pub(crate) fn decode_lossy(&self, bytes: &[u8]) -> String {
+        match self {
+            Self::BuiltIn(encoding) => encoding.decode_without_bom_handling(bytes).0.into_owned(),
+            Self::Cp437 => decode_single_byte(bytes, &CP437_HIGH),
+            Self::Cp850 => decode_single_byte(bytes, &CP850_HIGH),
+        }
+    }
+
     pub(crate) fn encode(&self, text: &str) -> Option<Vec<u8>> {
         match self {
             Self::BuiltIn(encoding) => {

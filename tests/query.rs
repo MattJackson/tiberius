@@ -2832,6 +2832,77 @@ where
     Ok(())
 }
 
+#[tokio::test]
+async fn lossy_codepage_config_reaches_decoder() -> Result<()> {
+    use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+    let mut config = tiberius::Config::from_ado_string(&CONN_STR)?;
+    config.database("master");
+    let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+    tcp.set_nodelay(true)?;
+    let mut admin = tiberius::Client::connect(config, tcp.compat_write()).await?;
+    let database = format!("tiberius_lossy_{}", Uuid::new_v4().simple());
+    admin
+        .simple_query(format!(
+            "CREATE DATABASE [{database}] COLLATE Chinese_PRC_CI_AS"
+        ))
+        .await?
+        .into_results()
+        .await?;
+
+    let outcomes: Result<_> = async {
+        let mut outcomes = Vec::new();
+        for lossy in [None, Some(false), Some(true)] {
+            let mut config = tiberius::Config::from_ado_string(&CONN_STR)?;
+            config.database(&database);
+            if let Some(lossy) = lossy {
+                config.lossy_codepage_decoding(lossy);
+            }
+            let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+            tcp.set_nodelay(true)?;
+            let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
+            let result = client
+                .simple_query(
+                    "SELECT CAST(0x61812062 AS VARCHAR(4)) AS malformed,
+                            CAST(0xFF AS VARCHAR(1)) AS lone_byte;
+                     SELECT CAST(0xD6D0CEC4 AS VARCHAR(4)) AS valid,
+                            CAST('next' AS VARCHAR(4)) AS following",
+                )
+                .await?
+                .into_results()
+                .await;
+            outcomes.push(result);
+        }
+        Ok(outcomes)
+    }
+    .await;
+
+    admin
+        .simple_query(format!(
+            "ALTER DATABASE [{database}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+             DROP DATABASE [{database}]"
+        ))
+        .await?
+        .into_results()
+        .await?;
+
+    let mut outcomes = outcomes?.into_iter();
+    for _ in 0..2 {
+        assert!(matches!(
+            outcomes.next().unwrap(),
+            Err(tiberius::error::Error::Encoding(_))
+        ));
+    }
+    let results = outcomes.next().unwrap()?;
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0][0].get::<&str, _>(0), Some("a\u{fffd} b"));
+    assert_eq!(results[0][0].get::<&str, _>(1), Some("\u{fffd}"));
+    assert_eq!(results[1][0].get::<&str, _>(0), Some("中文"));
+    assert_eq!(results[1][0].get::<&str, _>(1), Some("next"));
+
+    Ok(())
+}
+
 #[test_on_runtimes(connection_string = "APP_NAME_CONN_STR")]
 async fn application_name_should_be_set_correctly<S>(mut conn: tiberius::Client<S>) -> Result<()>
 where

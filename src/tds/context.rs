@@ -28,6 +28,10 @@ pub(crate) struct Context {
     /// [`Config::lossy_utf16_decoding`](crate::Config::lossy_utf16_decoding) at
     /// connect time. Defaults to `false` (strict decoding).
     lossy_utf16: bool,
+    /// Replaces invalid code-page row sequences with U+FFFD when enabled by
+    /// [`Config::lossy_codepage_decoding`](crate::Config::lossy_codepage_decoding)
+    /// at connect time. Defaults to `false`, independently of `lossy_utf16`.
+    lossy_codepage: bool,
 }
 
 impl Context {
@@ -50,6 +54,7 @@ impl Context {
             spn: None,
             command_timeout: None,
             lossy_utf16: false,
+            lossy_codepage: false,
         }
     }
 
@@ -112,6 +117,16 @@ impl Context {
     /// [`Config`](crate::Config) at connect time.
     pub(crate) fn set_lossy_utf16(&mut self, lossy: bool) {
         self.lossy_utf16 = lossy;
+    }
+
+    /// Whether malformed code-page row values use replacement decoding.
+    pub(crate) fn lossy_codepage(&self) -> bool {
+        self.lossy_codepage
+    }
+
+    /// Records the code-page decoding preference from the connection config.
+    pub(crate) fn set_lossy_codepage(&mut self, lossy: bool) {
+        self.lossy_codepage = lossy;
     }
 
     pub fn transaction_descriptor(&self) -> [u8; 8] {
