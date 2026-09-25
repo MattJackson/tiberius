@@ -127,21 +127,32 @@ jobs:
           # first) and waits for each to be available before the next. A
           # version that already exists is an error, which fails the job.
           cargo publish "${args[@]}"
+          # Record the exact .crate files cargo uploaded. `cargo publish`
+          # writes them to target/package/tmp-crate/ (current cargo) or
+          # target/package/ (older cargo); a missing file is an error.
+          : > "$RUNNER_TEMP/published.txt"
           for crate in $PUBLISH; do
             version=$(echo "$PLAN" | jq -r --arg c "$crate" '.releases[] | select(.crate == $c) | .version')
-            file="target/package/${crate}-${version}.crate"
-            echo "${crate} ${version}: $(sha256sum "$file" | cut -d' ' -f1)  $file"
+            file=""
+            for f in "target/package/tmp-crate/${crate}-${version}.crate" "target/package/${crate}-${version}.crate"; do
+              if [ -f "$f" ]; then file=$f; break; fi
+            done
+            if [ -z "$file" ]; then
+              echo "::error::no ${crate}-${version}.crate under target/package after cargo publish"
+              exit 1
+            fi
+            sum=$(sha256sum "$file" | cut -d' ' -f1)
+            echo "${crate} ${version} sha256 ${sum} ${file}"
+            echo "${crate} ${version} ${file}" >> "$RUNNER_TEMP/published.txt"
           done
       - name: Verify the registry index
         if: env.DRY_RUN != 'true' && env.PUBLISH != ''
         run: |
           set -euo pipefail
-          for crate in $PUBLISH; do
-            version=$(echo "$PLAN" | jq -r --arg c "$crate" '.releases[] | select(.crate == $c) | .version')
+          while read -r crate version file; do
             python3 .github/scripts/release_gate.py verify --registry "$REGISTRY" \
-              --crate "$crate" --version "$version" \
-              --crate-file "target/package/${crate}-${version}.crate" --timeout 900
-          done
+              --crate "$crate" --version "$version" --crate-file "$file" --timeout 900
+          done < "$RUNNER_TEMP/published.txt"
       - name: Tag and GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
