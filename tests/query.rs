@@ -2769,6 +2769,69 @@ where
     Ok(())
 }
 
+#[test_on_runtimes]
+async fn legacy_codepages_query_round_trip<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    for (collation, expected, expected_bytes) in [
+        (
+            "SQL_Latin1_General_CP437_BIN",
+            "Café α\u{a0}",
+            b"Caf\x82 \xe0\xff".as_slice(),
+        ),
+        (
+            "SQL_1xCompat_CP850_CI_AS",
+            "Café ø\u{a0}",
+            b"Caf\x82 \x9b\xff".as_slice(),
+        ),
+    ] {
+        conn.simple_query(format!(
+            "CREATE TABLE #legacy_codepages (
+                single CHAR(1) COLLATE {collation},
+                multi VARCHAR(32) COLLATE {collation},
+                huge VARCHAR(MAX) COLLATE {collation},
+                legacy TEXT COLLATE {collation}
+            )"
+        ))
+        .await?
+        .into_results()
+        .await?;
+
+        let long_value = expected.repeat(2000);
+        conn.execute(
+            "INSERT INTO #legacy_codepages VALUES (@P1, @P2, @P3, @P4)",
+            &[&"é", &expected, &long_value, &expected],
+        )
+        .await?;
+
+        let row = conn
+            .simple_query(
+                "SELECT single, multi, huge, legacy, CAST(multi AS SQL_VARIANT),
+                        CONVERT(VARBINARY(32), multi)
+                 FROM #legacy_codepages",
+            )
+            .await?
+            .into_row()
+            .await?
+            .unwrap();
+
+        assert_eq!(row.get::<&str, _>(0), Some("é"));
+        assert_eq!(row.get::<&str, _>(1), Some(expected));
+        assert_eq!(row.get::<&str, _>(2), Some(long_value.as_str()));
+        assert_eq!(row.get::<&str, _>(3), Some(expected));
+        assert_eq!(row.get::<&str, _>(4), Some(expected));
+        assert_eq!(row.get::<&[u8], _>(5), Some(expected_bytes));
+
+        conn.simple_query("DROP TABLE #legacy_codepages")
+            .await?
+            .into_results()
+            .await?;
+    }
+
+    Ok(())
+}
+
 #[test_on_runtimes(connection_string = "APP_NAME_CONN_STR")]
 async fn application_name_should_be_set_correctly<S>(mut conn: tiberius::Client<S>) -> Result<()>
 where

@@ -4,6 +4,28 @@ use crate::tds::Collation;
 use crate::VarLenContext;
 use bytes::{BufMut, BytesMut};
 
+const CP437_EXPECTED_HIGH: &str = concat!(
+    "ÇüéâäàåçêëèïîìÄÅ",
+    "ÉæÆôöòûùÿÖÜ¢£¥₧ƒ",
+    "áíóúñÑªº¿⌐¬½¼¡«»",
+    "░▒▓│┤╡╢╖╕╣║╗╝╜╛┐",
+    "└┴┬├─┼╞╟╚╔╩╦╠═╬╧",
+    "╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀",
+    "αßΓπΣσµτΦΘΩδ∞φε∩",
+    "≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u{a0}",
+);
+
+const CP850_EXPECTED_HIGH: &str = concat!(
+    "ÇüéâäàåçêëèïîìÄÅ",
+    "ÉæÆôöòûùÿÖÜø£Ø×ƒ",
+    "áíóúñÑªº¿®¬½¼¡«»",
+    "░▒▓│┤ÁÂÀ©╣║╗╝¢¥┐",
+    "└┴┬├─┼ãÃ╚╔╩╦╠═╬¤",
+    "ðÐÊËÈıÍÎÏ┘┌█▄¦Ì▀",
+    "ÓßÔÒõÕµþÞÚÛÙýÝ¯´",
+    "\u{ad}±‗¾¶§÷¸°¨·¹³²■\u{a0}",
+);
+
 fn wire_value(ty: VarLenType, payload: &[u8]) -> BytesMut {
     let mut wire = BytesMut::new();
     if ty == VarLenType::Text {
@@ -42,9 +64,16 @@ async fn legacy_codepages_decode_raw_char_varchar_and_text() {
 }
 
 #[tokio::test]
-async fn legacy_codepages_round_trip_every_byte() {
+async fn legacy_codepages_match_unicode_mappings_for_every_byte() {
     let payload: Vec<u8> = (0..=255).collect();
+    let ascii: String = (0..=127).map(char::from).collect();
     for sort_id in (30..=35).chain(40..=45).chain([49]).chain(55..=61) {
+        let high = if sort_id <= 35 {
+            CP437_EXPECTED_HIGH
+        } else {
+            CP850_EXPECTED_HIGH
+        };
+        let expected = format!("{ascii}{high}");
         for ty in [
             VarLenType::BigChar,
             VarLenType::BigVarChar,
@@ -57,6 +86,11 @@ async fn legacy_codepages_round_trip_every_byte() {
             ));
             let mut reader = wire_value(ty, &payload).into_sql_read_bytes();
             let decoded = ColumnData::decode(&mut reader, &type_info).await.unwrap();
+            assert_eq!(
+                decoded,
+                ColumnData::String(Some(expected.as_str().into())),
+                "sort ID {sort_id}, type {ty:?}",
+            );
             let mut encoded = BytesMut::new();
             decoded
                 .encode(&mut BytesMutWithTypeInfo::new(&mut encoded).with_type_info(&type_info))
@@ -64,7 +98,7 @@ async fn legacy_codepages_round_trip_every_byte() {
             assert!(encoded.ends_with(&payload));
             let mut reader = encoded.into_sql_read_bytes();
             let decoded = ColumnData::decode(&mut reader, &type_info).await.unwrap();
-            assert!(matches!(decoded, ColumnData::String(Some(_))));
+            assert_eq!(decoded, ColumnData::String(Some(expected.as_str().into())));
         }
     }
 }
@@ -86,7 +120,10 @@ fn legacy_codepages_reject_unrepresentable_bulk_values() {
             let error = ColumnData::String(Some("€".into()))
                 .encode(&mut BytesMutWithTypeInfo::new(&mut encoded).with_type_info(&type_info))
                 .unwrap_err();
-            assert!(matches!(error, crate::Error::Encoding(_)));
+            assert!(matches!(
+                error,
+                crate::Error::Encoding(message) if message == "unrepresentable character"
+            ));
         }
     }
 }
