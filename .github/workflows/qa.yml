@@ -150,7 +150,14 @@ jobs:
         # used by the script's readiness probe.
         shell: powershell
         run: ./.github/scripts/install-sqlserver-windows.ps1
-      - run: cargo test --no-fail-fast ${{ matrix.features }}
+      # The special-character password tests (tests/special_char_password.rs)
+      # derive a SQL-login connection string by appending user/password to
+      # TIBERIUS_TEST_CONNECTION_STRING. Here that string has
+      # IntegratedSecurity=true, so they would authenticate as Windows users
+      # and fail with 18452. They are SQL-auth tests and run on Linux and
+      # macOS. TODO: drop the skip once the test also appends
+      # `IntegratedSecurity=false`.
+      - run: cargo test --no-fail-fast ${{ matrix.features }} -- --skip password_authenticates
 
   semver:
     name: semver-checks (strict, vs crates.io)
