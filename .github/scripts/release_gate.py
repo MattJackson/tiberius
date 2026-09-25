@@ -278,7 +278,7 @@ class Registry:
 
     def entries(self, name: str, bust: bool = False) -> list:
         url = self.index_url + index_path(name)
-        if bust:
+        if bust and url.startswith("http"):
             url += f"?cache-bust={time.time_ns()}"
         raw = self.fetch(url)
         if raw is None:
@@ -646,7 +646,9 @@ def evaluate(
 
     # Tree identity with a green QA run on the QA branch.
     qa_match = None
-    if qa_runs is not None:
+    if qa_runs is not None and not git_ok(root, "rev-parse", "-q", "--verify", f"{qa_ref}^{{commit}}"):
+        errors.append(f"QA branch ref {qa_ref} not found; cannot prove this tree passed QA")
+    elif qa_runs is not None:
         qa_match, tree = find_qa_match(root, sha, qa_ref, qa_runs)
         if qa_match is None:
             errors.append(
