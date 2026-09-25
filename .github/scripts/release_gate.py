@@ -3,26 +3,33 @@
 
 Subcommands:
 
-  gate    Decide what a commit on (or headed for) `main` releases, and fail
-          with an actionable message when it must not be released. Writes the
+  gate    Decide whether a commit on (or headed for) `main` is a release, and
+          fail with an actionable message when it must not land. Writes the
           release plan to $GITHUB_OUTPUT.
   verify  After `cargo publish`, poll the registry index (bounded) for the new
           version and check its `cksum` against the local .crate file.
 
-The gate enforces, for every publishable workspace crate:
+Always: every publishable crate's version is valid semver and not lower than
+the registry's latest.
 
-  * the manifest version is valid semver and not lower than the registry's
-    latest version;
-  * an unchanged version means the package contents are identical to the
-    published .crate (cargo-generated files ignored), otherwise it must be
-    bumped;
-  * at least one crate is being released (every push to main is a release);
+Release (some crate's version is above the registry's latest, or a crate was
+already published from this very commit, i.e. a retry):
+
+  * a crate that is NOT being released has no release-relevant changes
+    (library sources, build script, manifest) against its published .crate;
   * CHANGELOG.md has a `## Version X.Y.Z` heading for the primary crate;
-  * the release tag does not already exist on a different commit;
+  * the release tags do not already exist on a different commit;
   * workspace dependencies required by a released crate are either
     published or released in the same run;
-  * the commit's tree equals the tree of a commit on the QA branch whose
-    QA workflow run succeeded (main only ever receives fully QA'd code).
+  * for a PR, the target branch tip is an ancestor of the PR head, so a
+    rebase (or squash) merge lands exactly the PR head's tree;
+  * the tree equals the tree of a commit on the QA branch whose QA workflow
+    run succeeded (main only ever receives fully QA'd code).
+
+No release (no version bumped): the change itself (PR base...head, or push
+before..after) must not touch release-relevant files. CI, docs, tests and
+other non-crate files pass as a no-op; crate code fails, because it may only
+reach main through a release.
 
 Only the Python standard library is used, so it runs on any runner.
 """
@@ -45,7 +52,13 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-NO_RELEASE_MSG = "release: nothing to publish, dev→main PRs must bump the version"
+NOT_RELEASED_MSG = (
+    "changes to crate code must reach main through a release "
+    "(bump the version via a dev→main PR)"
+)
+NOOP_MSG = "no crate code changed; nothing to release"
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+ZERO_SHA = "0" * 40
 
 REGISTRIES = {
     "crates-io": "https://index.crates.io/",
@@ -56,6 +69,13 @@ REGISTRIES = {
 # when the sources are identical, so they never count as a content change.
 # `Cargo.toml.orig` (the manifest as written) IS compared.
 GENERATED_FILES = {"Cargo.toml", "Cargo.lock", ".cargo_vcs_info.json"}
+
+
+def release_relevant(rel: str) -> bool:
+    """Package-relative path that changes the compiled crate: library
+    sources, the build script, or the manifest (`Cargo.toml.orig` in a
+    .crate). README, CHANGELOG, tests, examples, CI files etc. do not."""
+    return rel.startswith("src/") or rel in ("build.rs", "Cargo.toml.orig", "Cargo.toml")
 
 # Only these events run the real QA jobs. qa.yml also runs on pull_request
 # purely to report a (skipped) `qa-ok` status, so those runs prove nothing.
@@ -324,10 +344,25 @@ class Package:
     manifest: Path
     # (dependency name, requirement) for path dependencies on workspace crates
     workspace_deps: list
+    # Extra source roots (absolute) of lib / proc-macro / build-script targets
+    # that live outside `src/` (e.g. `[lib] path = "lib/mod.rs"`).
+    target_paths: list = dataclasses.field(default_factory=list)
 
     @property
     def dir(self) -> Path:
         return self.manifest.parent
+
+    def repo_relevant(self, root: Path, path: str) -> bool:
+        """Is repo-relative `path` release-relevant for this crate?"""
+        try:
+            rel = (root / path).relative_to(self.dir).as_posix()
+        except ValueError:
+            return False
+        if release_relevant(rel):
+            return True
+        return any(
+            (root / path) == t or t in (root / path).parents for t in self.target_paths
+        )
 
 
 def workspace_packages(root: Path) -> list:
@@ -345,7 +380,15 @@ def workspace_packages(root: Path) -> list:
             for d in p["dependencies"]
             if d["name"] in members and d.get("path") and d.get("kind") in (None, "build")
         ]
-        pkgs.append(Package(p["name"], p["version"], Path(p["manifest_path"]).resolve(), deps))
+        manifest = Path(p["manifest_path"]).resolve()
+        extra = []
+        for t in p.get("targets", []):
+            if set(t["kind"]) & {"lib", "proc-macro", "rlib", "dylib", "cdylib", "staticlib"}:
+                extra.append(Path(t["src_path"]).resolve().parent)
+            elif "custom-build" in t["kind"]:
+                extra.append(Path(t["src_path"]).resolve())
+        extra = [e for e in extra if e != manifest.parent]
+        pkgs.append(Package(p["name"], p["version"], manifest, deps, extra))
     return pkgs
 
 
@@ -472,6 +515,7 @@ class GateResult:
     errors: list
     notes: list
     qa_run: Optional[dict] = None
+    release: bool = False
 
     @property
     def publish(self) -> list:
@@ -517,6 +561,10 @@ def topo_order(pkgs: list) -> list:
     return out
 
 
+def changed_paths(root: Path, base: str, head: str) -> list:
+    return [p for p in git(root, "diff", "--no-renames", "--name-only", base, head).splitlines() if p]
+
+
 def evaluate(
     root: Path,
     sha: str,
@@ -526,11 +574,18 @@ def evaluate(
     qa_ref: str,
     changelog: str = "CHANGELOG.md",
     tag_remote: Optional[str] = None,
+    change_base: Optional[str] = None,
+    target_tip: Optional[str] = None,
 ) -> GateResult:
+    """`change_base`: commit to diff against for the no-release check (PR:
+    merge base with the target branch; push: `before`). Defaults to the
+    first parent. `target_tip`: for PRs, the target branch tip, which must be
+    an ancestor of `sha` for a release."""
     root = root.resolve()
     errors, notes, statuses = [], [], []
     pkgs = topo_order(workspace_packages(root))
     published_versions = {}
+    published_files = {}
 
     for pkg in pkgs:
         entries = registry.entries(pkg.name)
@@ -554,46 +609,60 @@ def evaluate(
 
         if latest is None:
             statuses.append(CrateStatus(pkg.name, str(local), "release", tag, "first release"))
-            continue
-
-        if same is not None:
-            published = registry.download(pkg.name, same.text or str(same))
-            pub_files, vcs_sha = crate_contents(published)
-            changed = diff_contents(local_contents(root, pkg), pub_files)
-            if changed:
-                errors.append(
-                    f"{pkg.name}: contents differ from the published {pkg.name} {same} but "
-                    f"the version was not bumped. Bump `version` in "
-                    f"{pkg.manifest.relative_to(root)} above {latest} (and add a changelog "
-                    "entry). Changed files: " + ", ".join(changed)
-                )
-                statuses.append(CrateStatus(pkg.name, str(local), "error", tag))
-            elif vcs_sha == sha:
-                statuses.append(
-                    CrateStatus(pkg.name, str(local), "resume", tag,
-                                "already published from this commit (retry)")
-                )
+        elif same is not None:
+            pub_files, vcs_sha = crate_contents(registry.download(pkg.name, same.text or str(same)))
+            published_files[pkg.name] = (same, pub_files)
+            if vcs_sha == sha:
+                statuses.append(CrateStatus(pkg.name, str(local), "resume", tag,
+                                            "already published from this commit (retry)"))
             else:
-                statuses.append(
-                    CrateStatus(pkg.name, str(local), "unchanged", tag, f"identical to published {same}")
-                )
-            if same != latest and not changed:
+                statuses.append(CrateStatus(pkg.name, str(local), "unchanged", tag,
+                                            f"version equals published {same}"))
+            if same != latest:
                 notes.append(f"{pkg.name}: {local} is published but older than latest {latest}")
-            continue
-
-        if local < latest:
+        elif local < latest:
             errors.append(
                 f"{pkg.name}: version {local} is lower than the latest published {latest}; "
                 f"set it above {latest}"
             )
             statuses.append(CrateStatus(pkg.name, str(local), "error", tag))
-            continue
+        else:
+            statuses.append(CrateStatus(pkg.name, str(local), "release", tag, f"{latest} -> {local}"))
 
-        statuses.append(CrateStatus(pkg.name, str(local), "release", tag, f"{latest} -> {local}"))
+    releasing = {s.name for s in statuses if s.action in ("release", "resume")}
+    result = GateResult(statuses, errors, notes, None, release=bool(releasing))
+
+    if not releasing:
+        # (b) No version bump: only non-crate changes may land on main.
+        base = change_base or (f"{sha}^1" if git_ok(root, "rev-parse", "-q", "--verify", f"{sha}^1")
+                               else EMPTY_TREE)
+        changed = changed_paths(root, base, sha)
+        relevant = [p for p in changed if any(pkg.repo_relevant(root, p) for pkg in pkgs)]
+        short = base[:12]
+        if relevant:
+            shown = relevant[:10] + ([f"... and {len(relevant) - 10} more"] if len(relevant) > 10 else [])
+            errors.append(f"{NOT_RELEASED_MSG}. Crate files changed since {short}: " + ", ".join(shown))
+        elif not errors:
+            notes.append(f"{NOOP_MSG} ({len(changed)} non-crate file(s) changed since {short})")
+        return result
 
     by_name = {s.name: s for s in statuses}
-    if not any(s.action in ("release", "resume") for s in statuses):
-        errors.append(NO_RELEASE_MSG)
+
+    # (a) Crates not being released must not carry unreleased crate changes.
+    for s in statuses:
+        if s.action != "unchanged":
+            continue
+        pkg = next(p for p in pkgs if p.name == s.name)
+        same, pub_files = published_files[s.name]
+        local = {k: v for k, v in local_contents(root, pkg).items() if release_relevant(k)}
+        pub = {k: v for k, v in pub_files.items() if release_relevant(k)}
+        changed = diff_contents(local, pub)
+        if changed:
+            errors.append(
+                f"{pkg.name}: crate code differs from the published {pkg.name} {same} but its "
+                f"version was not bumped. Bump `version` in {pkg.manifest.relative_to(root)} "
+                "and release it together. Changed files: " + ", ".join(changed)
+            )
 
     # Changelog heading for the primary crate.
     prim = next((p for p in pkgs if p.name == primary), None)
@@ -612,15 +681,13 @@ def evaluate(
         if s.action not in ("release", "resume"):
             continue
         target = tag_commit(root, s.tag, tag_remote)
-        if target is not None:
-            if target != sha:
-                errors.append(
-                    f"tag {s.tag} already exists on {target[:12]}, not on this commit "
-                    f"{sha[:12]}; {s.name} {s.version} was already tagged. Bump the version"
-                )
+        if target is not None and target != sha:
+            errors.append(
+                f"tag {s.tag} already exists on {target[:12]}, not on this commit "
+                f"{sha[:12]}; {s.name} {s.version} was already tagged. Bump the version"
+            )
 
     # Workspace dependencies of released crates must be available.
-    releasing = {s.name for s in statuses if s.action in ("release", "resume")}
     for pkg in pkgs:
         if pkg.name not in releasing:
             continue
@@ -644,17 +711,26 @@ def evaluate(
                     "the same PR (bump its version) or depend on a published version"
                 )
 
+    # A PR must sit on the current target tip so a rebase/squash merge lands
+    # exactly this tree.
+    if target_tip is not None and not git_ok(root, "merge-base", "--is-ancestor", target_tip, sha):
+        errors.append(
+            f"the release branch is not based on the current target tip {target_tip[:12]}, so a "
+            "rebase or squash merge would not land this exact tree. Recreate it from main with "
+            "dev's tree (see CONTRIBUTING.md, \"Releasing\")"
+        )
+
     # Tree identity with a green QA run on the QA branch.
-    qa_match = None
     if qa_runs is not None and not git_ok(root, "rev-parse", "-q", "--verify", f"{qa_ref}^{{commit}}"):
         errors.append(f"QA branch ref {qa_ref} not found; cannot prove this tree passed QA")
     elif qa_runs is not None:
         qa_match, tree = find_qa_match(root, sha, qa_ref, qa_runs)
+        result.qa_run = qa_match
         if qa_match is None:
             errors.append(
                 f"tree {tree[:12]} of {sha[:12]} does not match any commit on {qa_ref} with a "
                 "successful QA run. Land the change on dev through the merge queue (or run "
-                "qa.yml on dev), then open the dev→main PR from that exact state"
+                "qa.yml on dev), then create the release branch from that exact dev state"
             )
         else:
             notes.append(
@@ -662,7 +738,7 @@ def evaluate(
                 f"({qa_match['event']}): {qa_match['html_url']}"
             )
 
-    return GateResult(statuses, errors, notes, qa_match)
+    return result
 
 
 def write_outputs(result: GateResult, path: Optional[str]) -> None:
@@ -676,6 +752,7 @@ def write_outputs(result: GateResult, path: Optional[str]) -> None:
         ],
     }
     lines = [
+        f"release={'true' if result.release else 'false'}",
         f"publish={' '.join(plan['publish'])}",
         f"plan={json.dumps(plan, separators=(',', ':'))}",
     ]
@@ -683,6 +760,29 @@ def write_outputs(result: GateResult, path: Optional[str]) -> None:
         with open(path, "a") as f:
             f.write("\n".join(lines) + "\n")
     print("\n".join(lines))
+
+
+def resolve_range(root: Path, sha: str, args) -> tuple:
+    """(change_base, target_tip) for the event.
+
+    PR: diff from the merge base with the target branch; the target tip must
+    be an ancestor for a release. Push: diff from `before`; a zero SHA (new
+    branch) or an object that cannot be fetched (force-push) falls back to
+    the first parent, with a notice."""
+    if args.target:
+        tip = git(root, "rev-parse", f"{args.target}^{{commit}}")
+        return git(root, "merge-base", tip, sha), tip
+    before = args.before
+    if before and before != ZERO_SHA:
+        if not git_ok(root, "cat-file", "-e", f"{before}^{{commit}}"):
+            git_ok(root, "fetch", "--no-tags", "--quiet", "origin", before)
+        if git_ok(root, "cat-file", "-e", f"{before}^{{commit}}"):
+            return before, None
+        print(f"::notice title=release gate::push base {before[:12]} is not available; "
+              "comparing against the first parent instead")
+    elif before == ZERO_SHA:
+        print("::notice title=release gate::new branch (zero `before`); comparing against the first parent")
+    return None, None
 
 
 def cmd_gate(args) -> int:
@@ -698,8 +798,10 @@ def cmd_gate(args) -> int:
         token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
         qa_runs = github_qa_runs(args.repo, args.qa_workflow, token)
 
+    change_base, target_tip = resolve_range(root, sha, args)
     result = evaluate(
-        root, sha, registry, args.primary, qa_runs, args.qa_ref, tag_remote=args.tag_remote
+        root, sha, registry, args.primary, qa_runs, args.qa_ref, tag_remote=args.tag_remote,
+        change_base=change_base, target_tip=target_tip,
     )
 
     print(f"Release gate for {sha} ({registry.index_url})")
@@ -751,6 +853,9 @@ def main(argv=None) -> int:
     g.add_argument("--qa-workflow", default="qa.yml")
     g.add_argument("--qa-ref", default="origin/dev", help="QA'd commits must be reachable from this")
     g.add_argument("--qa-runs-file", help="JSON list of runs instead of the GitHub API (tests)")
+    g.add_argument("--target", help="PR target branch ref (e.g. origin/main): diff from the "
+                   "merge base, and require the tip to be an ancestor for a release")
+    g.add_argument("--before", help="push: the previous tip (github.event.before)")
     g.add_argument("--tag-remote", help="look tags up on this remote instead of local refs")
     g.add_argument("--skip-qa-check", action="store_true", help="skip tree identity (local use)")
     g.add_argument("--no-output", action="store_true")
