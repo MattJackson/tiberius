@@ -320,3 +320,5 @@ mod driver_version_tests {
         assert_ne!(super::get_driver_version(), 0);
     }
 }
+
+// fork proof: crate code change without a version bump (gate must fail)
