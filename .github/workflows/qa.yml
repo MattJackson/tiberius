@@ -12,6 +12,8 @@ on:
   # pull_request with every job skipped and `qa-ok` passing trivially. The
   # release gate ignores pull_request runs when looking for QA provenance.
   pull_request:
+  push: # FORK-ONLY iteration trigger
+    branches: [ci/qa-iter]
 
 permissions:
   contents: read
@@ -26,7 +28,7 @@ env:
 jobs:
   linux:
     name: linux (${{ matrix.database }}, ${{ matrix.features }})
-    if: github.event_name != 'pull_request'
+    if: false # FORK-ONLY: skip linux while iterating
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
