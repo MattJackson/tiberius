@@ -326,6 +326,236 @@ where
     Ok(())
 }
 
+/// Bulk-insert "Привет" into Cyrillic_General_CI_AS (CP1251) columns of
+/// `table` and check the stored bytes. The database default collation must
+/// not use CP1251 for this to detect a missing `COLLATE` in `INSERT BULK`:
+/// the server would then read the CP1251 bytes in the default code page.
+async fn bulk_cyrillic_roundtrip<S>(conn: &mut tiberius::Client<S>, table: &str) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let default_code_page = conn
+        .query(
+            "SELECT CONVERT(INT, COLLATIONPROPERTY(CONVERT(NVARCHAR(128), \
+             DATABASEPROPERTYEX(DB_NAME(), 'Collation')), 'CodePage'))",
+            &[],
+        )
+        .await?
+        .into_row()
+        .await?
+        .unwrap()
+        .get::<i32, _>(0);
+    assert_ne!(Some(1251), default_code_page);
+
+    // A plain batch, not `execute`: a `#` temp table created inside the
+    // sp_executesql call `execute` sends is dropped when that call returns.
+    conn.simple_query(format!(
+        "CREATE TABLE {} (id INT NOT NULL, \
+         v VARCHAR(20) COLLATE Cyrillic_General_CI_AS NOT NULL, \
+         c CHAR(6) COLLATE Cyrillic_General_CI_AS NOT NULL, \
+         t TEXT COLLATE Cyrillic_General_CI_AS NOT NULL, \
+         n NVARCHAR(20) COLLATE Cyrillic_General_CI_AS NOT NULL)",
+        table
+    ))
+    .await?
+    .into_results()
+    .await?;
+
+    let expected = "Привет";
+    let mut req = conn.bulk_insert(table).await?;
+    let mut row = TokenRow::new();
+    row.push(1i32.into_sql());
+    row.push(expected.into_sql());
+    row.push(expected.into_sql());
+    row.push(expected.into_sql());
+    row.push(expected.into_sql());
+    req.send(row).await?;
+    assert_eq!(1, req.finalize().await?.total());
+
+    let row = conn
+        .query(
+            &format!(
+                "SELECT v, c, t, n, CONVERT(VARBINARY(20), v), CONVERT(VARBINARY(20), c), \
+                 CONVERT(VARBINARY(20), CONVERT(VARCHAR(20), t)) FROM {}",
+                table
+            ),
+            &[],
+        )
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    let cp1251: &[u8] = &[0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2];
+    assert_eq!(Some(expected), row.get::<&str, _>(0));
+    assert_eq!(Some(expected), row.get::<&str, _>(1));
+    assert_eq!(Some(expected), row.get::<&str, _>(2));
+    assert_eq!(Some(expected), row.get::<&str, _>(3));
+    assert_eq!(Some(cp1251), row.get::<&[u8], _>(4));
+    assert_eq!(Some(cp1251), row.get::<&[u8], _>(5));
+    assert_eq!(Some(cp1251), row.get::<&[u8], _>(6));
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn bulk_text_keeps_a_non_default_column_collation<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // A table in the current database, named with its schema.
+    let table = format!("dbo.bulk_collate_{}", random_table().await);
+
+    let result = bulk_cyrillic_roundtrip(&mut conn, &table).await;
+    drop_table(&mut conn, &format!("N'{table}'"), &table).await?;
+
+    result
+}
+
+/// Drops `table`, whose `OBJECT_ID` name is `object_name`, in a plain batch.
+async fn drop_table<S>(conn: &mut tiberius::Client<S>, object_name: &str, table: &str) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    conn.simple_query(format!(
+        "IF OBJECT_ID({object_name}) IS NOT NULL DROP TABLE {table}"
+    ))
+    .await?
+    .into_results()
+    .await?;
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn bulk_text_keeps_a_non_default_column_collation_in_a_temp_table<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("#{}", random_table().await);
+
+    let result = bulk_cyrillic_roundtrip(&mut conn, &table).await;
+    drop_table(&mut conn, &format!("N'tempdb..{table}'"), &table).await?;
+
+    result
+}
+
+/// Bulk-insert every byte 0x80..=0xFF of the code page of `collation`, as
+/// text decoded by the client, into char, varchar, varchar(max) and text
+/// columns of the # temp table `table` and check the stored bytes.
+async fn bulk_every_high_byte_roundtrip<S>(
+    conn: &mut tiberius::Client<S>,
+    table: &str,
+    collation: &str,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let bytes: Vec<u8> = (0x80..=0xFF).collect();
+    let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+
+    conn.simple_query(format!(
+        "CREATE TABLE {table} (c CHAR(128) COLLATE {collation} NOT NULL, \
+         v VARCHAR(128) COLLATE {collation} NOT NULL, \
+         m VARCHAR(MAX) COLLATE {collation} NOT NULL, \
+         t TEXT COLLATE {collation} NOT NULL)"
+    ))
+    .await?
+    .into_results()
+    .await?;
+
+    // The text of the 128 bytes: a varchar value of the collation (a binary
+    // value converts to it byte for byte), decoded by the client, and the
+    // server's own decoding of it for comparison.
+    let row = conn
+        .simple_query(format!(
+            "DECLARE @t TABLE (v VARCHAR(128) COLLATE {collation}); \
+             INSERT INTO @t VALUES (0x{hex}); \
+             SELECT v, CONVERT(NVARCHAR(128), v), CONVERT(VARBINARY(128), v) FROM @t"
+        ))
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+    assert_eq!(
+        Some(bytes.as_slice()),
+        row.get::<&[u8], _>(2),
+        "{collation}"
+    );
+    let text = row.get::<&str, _>(0).unwrap().to_owned();
+    assert_eq!(Some(text.as_str()), row.get::<&str, _>(1), "{collation}");
+    assert_eq!(128, text.chars().count(), "{collation}");
+
+    let mut req = conn.bulk_insert(table).await?;
+    let mut row = TokenRow::new();
+    for _ in 0..4 {
+        row.push(text.clone().into_sql());
+    }
+    req.send(row).await?;
+    assert_eq!(1, req.finalize().await?.total());
+
+    let row = conn
+        .simple_query(format!(
+            "SELECT CONVERT(VARBINARY(MAX), c), CONVERT(VARBINARY(MAX), v), \
+             CONVERT(VARBINARY(MAX), m), \
+             CONVERT(VARBINARY(MAX), CONVERT(VARCHAR(MAX), t)) FROM {table}"
+        ))
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    for (i, column) in ["c", "v", "m", "t"].into_iter().enumerate() {
+        assert_eq!(
+            Some(bytes.as_slice()),
+            row.get::<&[u8], _>(i),
+            "{collation} column {column}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn bulk_legacy_code_pages_store_every_high_byte<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // Detecting a missing `COLLATE` in `INSERT BULK` needs a database default
+    // code page other than the columns'.
+    let default_code_page = conn
+        .query(
+            "SELECT CONVERT(INT, COLLATIONPROPERTY(CONVERT(NVARCHAR(128), \
+             DATABASEPROPERTYEX(DB_NAME(), 'Collation')), 'CodePage'))",
+            &[],
+        )
+        .await?
+        .into_row()
+        .await?
+        .unwrap()
+        .get::<i32, _>(0);
+
+    for (collation, code_page) in [
+        ("SQL_Latin1_General_CP437_BIN", 437),
+        ("SQL_1xCompat_CP850_CI_AS", 850),
+    ] {
+        assert_ne!(Some(code_page), default_code_page);
+
+        let table = format!("#{}", random_table().await);
+        let result = bulk_every_high_byte_roundtrip(&mut conn, &table, collation).await;
+        drop_table(&mut conn, &format!("N'tempdb..{table}'"), &table).await?;
+        result?;
+    }
+
+    Ok(())
+}
+
 #[cfg(all(feature = "tds73", feature = "chrono"))]
 test_bulk_type!(datetime2(
     "DATETIME2",
