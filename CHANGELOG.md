@@ -4,6 +4,7 @@
 
 - Throwaway pre-release used only to prove the release pipeline on a fork.
   Never published.
+- Extra change that never went through QA on dev (gate must reject).
 
 ## Version 0.13.0
 
