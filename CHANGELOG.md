@@ -1,9 +1,13 @@
 # Changes
 
+## Version 0.13.1-proof.2
+
+- Throwaway pre-release (release cycle 2). Never published.
+
 ## Version 0.13.1-proof.1
 
 - Throwaway pre-release (release cycle 1) proving the pipeline on a fork.
-  Never published.
+  Never published. (Edited on dev after release 1 to overlap its lines.)
 
 ## Version 0.13.0
 
