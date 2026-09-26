@@ -1,5 +1,10 @@
 # Changes
 
+## Version 0.13.1-proof.1
+
+- Throwaway pre-release used only to prove the release pipeline on a fork.
+  Never published.
+
 ## Version 0.13.0
 
 - feat: TLS trust configuration is revamped around two orthogonal axes plus a
