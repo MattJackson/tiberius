@@ -17,11 +17,9 @@
 
 ## Releasing
 
-`main` always equals the latest crates.io release. Changes that bump no
-version may still land on `main` when they touch no crate code (CI, docs,
-tests); the release gate passes them as a no-op. Crate code (`src/`,
-`build.rs`, the manifests, `tiberius-macros/src/`) only reaches `main`
-through a release.
+`main` always equals the latest crates.io release, and every PR into `main`
+is a release. Everything else, including CI and docs changes, goes to `dev`
+and reaches `main` with the next release.
 
 1. On `dev`, land a PR that bumps `version` in `Cargo.toml` (and in
    `tiberius-macros/Cargo.toml` if the macros changed) and adds a
@@ -44,10 +42,13 @@ through a release.
    saw.
 3. Open a PR from `release/X.Y.Z` into `main`. The `release gate` check
    verifies:
-   - the version bump and the changelog heading;
+   - the version bump (a PR without one fails) and the changelog heading;
    - that the tag is free;
    - that the branch contains the current `main` tip;
-   - that the tree is identical to a `dev` commit that passed QA.
+   - that the tree is identical to a `dev` commit that passed QA, including
+     its strict semver check;
+   - that `tiberius-macros`, if not bumped, is unchanged since its last
+     release.
 4. Merge it with **Rebase and merge** (or squash). Publishing is automatic:
    `.github/workflows/release.yml` publishes to crates.io with Trusted
    Publishing, verifies the index, then tags `vX.Y.Z` and creates the
