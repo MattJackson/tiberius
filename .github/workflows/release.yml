@@ -1,8 +1,8 @@
 name: Release
 
 # main always equals the latest crates.io release. Every PR into main is a
-# release: a release branch whose tree is a QA'd dev state with a version +
-# CHANGELOG bump (see CONTRIBUTING.md), landed with a rebase (or squash) merge.
+# release: a PR from dev (QA'd, with a version + CHANGELOG bump) merged with
+# "Create a merge commit" (see CONTRIBUTING.md).
 #
 #   pull_request into main  -> strict `release gate` (required check on main)
 #   push to main            -> if a version is above crates.io: publish via
@@ -39,7 +39,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Fork proof only: RELEASE_REGISTRY=staging targets staging.crates.io.
+  # Fork proofs only: RELEASE_REGISTRY=staging targets staging.crates.io;
+  # RELEASE_DRY_RUN=true lets a push run the publish job as a dry run (no
+  # authentication, no upload, no tag) in any repo.
   REGISTRY: ${{ vars.RELEASE_REGISTRY == 'staging' && 'staging' || 'crates-io' }}
 
 jobs:
@@ -56,9 +58,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          # On PRs judge the PR head itself (not GitHub's test merge): with a
-          # rebase or squash merge, the head's tree is what lands.
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Default ref: on PRs this is GitHub's test merge commit, i.e.
+          # exactly the tree "Create a merge commit" will land on main.
           # All branches and tags: the gate needs dev's and main's history and the tags.
           fetch-depth: 0
           persist-credentials: false
@@ -72,15 +73,19 @@ jobs:
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SHA: ${{ github.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
           mode=()
-          # PR: the strict release gate against the target branch tip.
-          # Push / dispatch: publish if a version is above crates.io.
-          if [ "$EVENT" = pull_request ]; then mode=(--target "origin/$BASE_REF"); fi
+          # PR: the strict release gate. SHA is the test merge commit; the
+          # head must be on dev. Push / dispatch: publish if a version is
+          # above crates.io.
+          if [ "$EVENT" = pull_request ]; then
+            mode=(--target "origin/$BASE_REF" --head "$HEAD_SHA")
+          fi
           python3 .github/scripts/release_gate.py gate --sha "$SHA" --registry "$REGISTRY" \
             --qa-ref origin/dev "${mode[@]}"
 
@@ -96,13 +101,14 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.dry_run) ||
       ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
        github.ref == 'refs/heads/main' &&
-       (github.repository == 'tiberius-rs/tiberius' || vars.RELEASE_REGISTRY == 'staging')))
+       (github.repository == 'tiberius-rs/tiberius' || vars.RELEASE_REGISTRY == 'staging' ||
+        vars.RELEASE_DRY_RUN == 'true')))
     runs-on: ubuntu-latest
     permissions:
       contents: write # gh release create (creates the tag)
       id-token: write # crates.io Trusted Publishing
     env:
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || vars.RELEASE_DRY_RUN == 'true' }}
       PUBLISH: ${{ needs.gate.outputs.publish }}
       PLAN: ${{ needs.gate.outputs.plan }}
       SHA: ${{ github.sha }}

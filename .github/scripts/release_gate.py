@@ -22,10 +22,13 @@ Pull request into main (strict; every PR into main is a release):
     in the same run;
   * a crate NOT being released is unchanged against its published .crate
     (cargo-generated files ignored);
-  * the target branch tip is an ancestor of the PR head, so a rebase or
-    squash merge lands exactly the PR head's tree;
-  * the tree equals the tree of a commit on the QA branch whose QA workflow
-    run succeeded. That run includes the strict semver check.
+  * the PR head is the QA branch (dev) or a commit reachable from it;
+  * the tree of the merge result (GitHub's test merge commit, i.e. exactly
+    what "Create a merge commit" lands on main) equals the tree of a commit
+    on the QA branch whose QA workflow run succeeded. That run includes the
+    strict semver check. Because main only ever receives merges of dev, the
+    merge result's tree is dev's tree; any change that reached main another
+    way makes it differ, and the gate fails.
 
 Push to main (simple): a crate whose version is above the registry's latest
 is published (after the changelog, tag and dependency sanity checks); if no
@@ -547,9 +550,12 @@ def evaluate(
     tag_remote: Optional[str] = None,
     mode: str = "push",
     target_tip: Optional[str] = None,
+    head: Optional[str] = None,
 ) -> GateResult:
     """`mode`: "pr" (strict release gate) or "push" (publish if bumped).
-    `target_tip`: for "pr", the target branch tip. `qa_runs`: a list of
+    `sha`: the commit whose contents are judged (for a PR, GitHub's test
+    merge commit). `target_tip`: for "pr", the target branch tip. `head`:
+    for "pr", the PR head commit (defaults to `sha`). `qa_runs`: a list of
     runs, a callable returning one (fetched only when needed), or None to
     skip the tree-identity check."""
     root = root.resolve()
@@ -615,8 +621,8 @@ def evaluate(
     if not releasing:
         if mode == "pr":
             errors.append(
-                f"{NO_BUMP_MSG}: set a version above crates.io latest in Cargo.toml (and "
-                "tiberius-macros/Cargo.toml if it changed), from dev, via a release branch"
+                f"{NO_BUMP_MSG}: land a version bump above crates.io latest (Cargo.toml, and "
+                "tiberius-macros/Cargo.toml if it changed) on dev, then open the PR from dev"
             )
         elif not errors:
             notes.append(NOOP_MSG)
@@ -689,13 +695,14 @@ def evaluate(
                 f"{pkg.manifest.relative_to(root)}. Changed files: " + ", ".join(changed)
             )
 
-    # The PR must sit on the current target tip so a rebase/squash merge
-    # lands exactly this tree.
-    if not git_ok(root, "merge-base", "--is-ancestor", target_tip, sha):
+    # Releases come from dev: the PR head is dev itself or a commit on it.
+    head = head or sha
+    if git_ok(root, "rev-parse", "-q", "--verify", f"{qa_ref}^{{commit}}") and not git_ok(
+        root, "merge-base", "--is-ancestor", head, qa_ref
+    ):
         errors.append(
-            f"the release branch does not contain the current target tip {target_tip[:12]}, so a "
-            "rebase or squash merge would not land this exact tree. Recreate it from main with "
-            "dev's tree (see CONTRIBUTING.md, \"Releasing\")"
+            f"release PRs must come from dev: head {head[:12]} is not on {qa_ref}. Open the "
+            "PR from `dev` into `main`"
         )
 
     # Tree identity with a green QA run on the QA branch.
@@ -710,7 +717,9 @@ def evaluate(
             errors.append(
                 f"tree {tree[:12]} of {sha[:12]} does not match any commit on {qa_ref} with a "
                 "successful QA run. Land the change on dev through the merge queue (or run "
-                "qa.yml on dev), then create the release branch from that exact dev state"
+                "qa.yml on dev), then open the dev→main PR from that exact state. If main "
+                "received a change that is not on dev, the merge result differs from every "
+                "dev tree: bring that change to dev first"
             )
         else:
             notes.append(
@@ -758,9 +767,10 @@ def cmd_gate(args) -> int:
         token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
         qa_runs = lambda: github_qa_runs(args.repo, args.qa_workflow, token)  # noqa: E731
 
+    head = git(root, "rev-parse", args.head) if args.head else None
     result = evaluate(
         root, sha, registry, args.primary, qa_runs, args.qa_ref, tag_remote=args.tag_remote,
-        mode=mode, target_tip=target_tip,
+        mode=mode, target_tip=target_tip, head=head,
     )
 
     print(f"Release gate ({mode}) for {sha} ({registry.index_url})")
@@ -814,6 +824,8 @@ def main(argv=None) -> int:
     g.add_argument("--qa-runs-file", help="JSON list of runs instead of the GitHub API (tests)")
     g.add_argument("--target", help="PR mode: the target branch ref (e.g. origin/main). "
                    "Without it the gate runs in push mode")
+    g.add_argument("--head", help="PR mode: the PR head commit (must be on --qa-ref); "
+                   "--sha is then the test merge commit")
     g.add_argument("--tag-remote", help="look tags up on this remote instead of local refs")
     g.add_argument("--skip-qa-check", action="store_true", help="skip tree identity (local use)")
     g.add_argument("--no-output", action="store_true")

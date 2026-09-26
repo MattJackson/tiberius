@@ -119,14 +119,17 @@ class Fixture:
     def registry(self):
         return rg.Registry(f"file://{self.index}/")
 
-    def gate(self, sha="HEAD", qa_runs=None, qa_ref="dev", mode="pr", target_tip="BASE"):
+    def gate(self, sha="HEAD", qa_runs=None, qa_ref="dev", mode="pr", target_tip="BASE",
+             head=None):
         """PR mode by default, targeting the fixture's base commit (as if
         main were at the last release and dev branched from it)."""
         sha = sh(self.repo, "git", "rev-parse", sha)
         if target_tip == "BASE":
             target_tip = self.base
+        head = sh(self.repo, "git", "rev-parse", head) if head else None
         return rg.evaluate(self.repo, sha, self.registry(), "tiberius", qa_runs, qa_ref,
-                           mode=mode, target_tip=target_tip if mode == "pr" else None)
+                           mode=mode, target_tip=target_tip if mode == "pr" else None,
+                           head=head)
 
 
 def run_for(sha, event="merge_group", conclusion="success"):
@@ -279,35 +282,62 @@ class GateTests(unittest.TestCase):
         r = self.fx.gate(sha=sha, qa_runs=[run_for(sha, event="workflow_dispatch")])
         self.assertError(r, "does not match any commit on dev")
 
-    # -- rebase merges: the release-branch recipe ------------------------------
+    # -- merge-commit releases: dev -> main ------------------------------------
 
-    def test_release_branch_must_contain_target_tip(self):
-        # main moved on after the last release (rebase-merged copies, so dev
-        # does not contain it).
-        sh(self.fx.repo, "git", "checkout", "-q", "-b", "main")
-        main_tip = self.touch("docs/x.md", "x\n", "main-only commit")
-        sh(self.fx.repo, "git", "checkout", "-q", "dev")
-        d = self.bump()
-        r = self.fx.gate(qa_runs=[run_for(d)], target_tip=main_tip)
-        self.assertError(r, "does not contain the current target tip")
-        # CONTRIBUTING.md recipe: one commit on main with dev's exact tree.
-        snap = sh(self.fx.repo, "git", "commit-tree", f"{d}^{{tree}}", "-p", main_tip, "-m", "release")
-        r = self.fx.gate(sha=snap, qa_runs=[run_for(d)], target_tip=main_tip)
-        self.assertEqual(r.errors, [])
-
-    def test_rebase_rewritten_shas_keep_tree_identity(self):
-        # "Rebase and merge" replays commits with new SHAs; tree identity
-        # still matches the QA'd dev commit.
-        self.touch("src/lib.rs", "pub fn feature() {}\n", "feature")
-        d = self.bump()
-        sh(self.fx.repo, "git", "checkout", "-q", "-b", "main", self.fx.base)
+    def merge_into_main(self, dev_sha, msg):
+        """What GitHub's "Create a merge commit" does (also its PR test merge)."""
+        sh(self.fx.repo, "git", "checkout", "-q", "main")
         sh(self.fx.repo, "git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
-           "cherry-pick", "-x", f"{self.fx.base}..{d}")
+           "merge", "-q", "--no-ff", "-m", msg, dev_sha)
         m = self.rev()
-        self.assertNotEqual(m, d)
         sh(self.fx.repo, "git", "checkout", "-q", "dev")
-        r = self.fx.gate(sha=m, qa_runs=[run_for(d)])
+        return m
+
+    def test_two_merge_commit_release_cycles(self):
+        sh(self.fx.repo, "git", "branch", "main", self.fx.base)
+        # Cycle 1: dev work + bump, QA'd, merged into main with a merge commit.
+        self.touch("src/lib.rs", "pub fn one() {}\n", "feature one")
+        d1 = self.bump()
+        m1 = self.merge_into_main(d1, "Merge dev (0.13.1)")
+        self.assertEqual(self.rev(f"{m1}^{{tree}}"), self.rev(f"{d1}^{{tree}}"))
+        r = self.fx.gate(sha=m1, head=d1, target_tip=self.fx.base, qa_runs=[run_for(d1)])
         self.assertEqual(r.errors, [])
+        self.fx.publish("tiberius", "0.13.1")
+        # Cycle 2: dev never received main's merge commit, yet the next
+        # merge is clean and lands dev's tree exactly.
+        self.touch("src/lib.rs", "pub fn two() {}\n", "feature two")
+        d2 = self.bump(tib="0.13.2", changelog=("0.13.2", "0.13.1", "0.13.0"))
+        # `git merge-tree` exits non-zero on conflicts (sh() would raise).
+        sh(self.fx.repo, "git", "merge-tree", "--write-tree", m1, d2)
+        m2 = self.merge_into_main(d2, "Merge dev (0.13.2)")
+        self.assertEqual(self.rev(f"{m2}^{{tree}}"), self.rev(f"{d2}^{{tree}}"))
+        r = self.fx.gate(sha=m2, head=d2, target_tip=m1, qa_runs=[run_for(d2)])
+        self.assertEqual(r.errors, [])
+        self.assertEqual([c.version for c in r.publish], ["0.13.2"])
+        # main's history contains dev's original commits (same SHAs).
+        for c in (d1, d2):
+            self.assertTrue(rg.git_ok(self.fx.repo, "merge-base", "--is-ancestor", c, m2))
+
+    def test_change_that_bypassed_dev_fails_tree_identity(self):
+        sh(self.fx.repo, "git", "checkout", "-q", "-b", "main", self.fx.base)
+        stray = self.touch("docs/hotfix.md", "only on main\n", "direct commit to main")
+        sh(self.fx.repo, "git", "checkout", "-q", "dev")
+        d = self.bump()
+        m = self.merge_into_main(d, "Merge dev")
+        r = self.fx.gate(sha=m, head=d, target_tip=stray, qa_runs=[run_for(d)])
+        self.assertError(r, "does not match any commit on dev with a successful QA run")
+
+    def test_pr_head_not_on_dev_fails(self):
+        sh(self.fx.repo, "git", "checkout", "-q", "-b", "feature")
+        f = self.bump()
+        sh(self.fx.repo, "git", "checkout", "-q", "dev")
+        # Even with a QA'd identical tree on dev, the head itself must be on dev.
+        sh(self.fx.repo, "git", "merge", "-q", "--squash", "feature")
+        d = self.fx.commit("same tree on dev")
+        self.assertEqual(self.rev(f"{f}^{{tree}}"), self.rev(f"{d}^{{tree}}"))
+        r = self.fx.gate(sha=f, head=f, qa_runs=[run_for(d)])
+        self.assertError(r, "release PRs must come from dev")
+        self.assertEqual(self.fx.gate(sha=d, head=d, qa_runs=[run_for(d)]).errors, [])
 
     # -- bootstrap: keyed strictly on release.yml at the target tip -----------
 
