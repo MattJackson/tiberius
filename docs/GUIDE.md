@@ -323,3 +323,5 @@ Server error code, state, class, message, procedure and line.
 [`Query`]: https://docs.rs/tiberius/latest/tiberius/struct.Query.html
 [`Command`]: https://docs.rs/tiberius/latest/tiberius/struct.Command.html
 [`tiberius::error::Error`]: https://docs.rs/tiberius/latest/tiberius/error/enum.Error.html
+
+<!-- fork proof cycle 2: follow-up work on dev -->
